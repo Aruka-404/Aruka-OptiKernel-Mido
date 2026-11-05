@@ -15,22 +15,7 @@
 #include <linux/pagemap.h>
 #include <linux/quotaops.h>
 #include <linux/backing-dev.h>
-#include <linux/fb.h>
-#include <linux/notifier.h>
-#include <linux/moduleparam.h>
-#include <linux/kobject.h>
 #include "internal.h"
-
-/*
- * Dynamic Fsync control for low-latency interactive flash storage
- */
-bool fsync_enabled __read_mostly = true;
-module_param_named(fsync_enabled, fsync_enabled, bool, 0644);
-
-bool dyn_fsync_active __read_mostly = true;
-module_param_named(dyn_fsync_active, dyn_fsync_active, bool, 0644);
-
-static bool screen_is_on __read_mostly = true;
 
 #define VALID_FLAGS (SYNC_FILE_RANGE_WAIT_BEFORE|SYNC_FILE_RANGE_WRITE| \
 			SYNC_FILE_RANGE_WAIT_AFTER)
@@ -226,14 +211,7 @@ static int do_fsync(unsigned int fd, int datasync)
 	int ret = -EBADF;
 
 	if (f.file) {
-		if (likely(fsync_enabled)) {
-			if (!dyn_fsync_active || !screen_is_on)
-				ret = vfs_fsync(f.file, datasync);
-			else
-				ret = 0;
-		} else {
-			ret = 0;
-		}
+		ret = vfs_fsync(f.file, datasync);
 		fdput(f);
 		inc_syscfs(current);
 	}
@@ -387,97 +365,3 @@ SYSCALL_DEFINE4(sync_file_range2, int, fd, unsigned int, flags,
 {
 	return sys_sync_file_range(fd, offset, nbytes, flags);
 }
-
-/*
- * Dynamic Fsync sysfs interface & Framebuffer notifier
- */
-static ssize_t dyn_fsync_active_show(struct kobject *kobj,
-				    struct kobj_attribute *attr, char *buf)
-{
-	return sprintf(buf, "%u\n", dyn_fsync_active ? 1 : 0);
-}
-
-static ssize_t dyn_fsync_active_store(struct kobject *kobj,
-				     struct kobj_attribute *attr,
-				     const char *buf, size_t count)
-{
-	int val;
-
-	if (sscanf(buf, "%d", &val) != 1)
-		return -EINVAL;
-
-	dyn_fsync_active = !!val;
-	return count;
-}
-
-static struct kobj_attribute dyn_fsync_active_attr =
-	__ATTR(Dyn_fsync_active, 0644, dyn_fsync_active_show, dyn_fsync_active_store);
-
-static struct kobj_attribute dyn_fsync_active_lower_attr =
-	__ATTR(dyn_fsync_active, 0644, dyn_fsync_active_show, dyn_fsync_active_store);
-
-static struct attribute *dyn_fsync_attrs[] = {
-	&dyn_fsync_active_attr.attr,
-	&dyn_fsync_active_lower_attr.attr,
-	NULL,
-};
-
-static struct attribute_group dyn_fsync_attr_group = {
-	.attrs = dyn_fsync_attrs,
-};
-
-static void dyn_fsync_work_fn(struct work_struct *work)
-{
-	int nowait = 0, wait = 1;
-
-	wakeup_flusher_threads(0, WB_REASON_SYNC);
-	iterate_supers(sync_inodes_one_sb, NULL);
-	iterate_supers(sync_fs_one_sb, &nowait);
-	iterate_supers(sync_fs_one_sb, &wait);
-	iterate_bdevs(fdatawrite_one_bdev, NULL);
-	iterate_bdevs(fdatawait_one_bdev, NULL);
-}
-static DECLARE_WORK(dyn_fsync_work, dyn_fsync_work_fn);
-
-static int dyn_fsync_fb_notifier_callback(struct notifier_block *self,
-					 unsigned long event, void *data)
-{
-	struct fb_event *evdata = data;
-	int *blank;
-
-	if (event != FB_EVENT_BLANK || !evdata || !evdata->data)
-		return 0;
-
-	blank = evdata->data;
-	if (*blank == FB_BLANK_UNBLANK) {
-		screen_is_on = true;
-	} else if (*blank == FB_BLANK_POWERDOWN) {
-		screen_is_on = false;
-		if (dyn_fsync_active && fsync_enabled)
-			schedule_work(&dyn_fsync_work);
-	}
-
-	return 0;
-}
-
-static struct notifier_block dyn_fsync_fb_notif = {
-	.notifier_call = dyn_fsync_fb_notifier_callback,
-};
-
-static int __init dyn_fsync_init(void)
-{
-	struct kobject *dyn_fsync_kobj;
-	int ret;
-
-	dyn_fsync_kobj = kobject_create_and_add("dyn_fsync", kernel_kobj);
-	if (dyn_fsync_kobj) {
-		ret = sysfs_create_group(dyn_fsync_kobj, &dyn_fsync_attr_group);
-		if (ret)
-			kobject_put(dyn_fsync_kobj);
-	}
-
-	fb_register_client(&dyn_fsync_fb_notif);
-	return 0;
-}
-late_initcall(dyn_fsync_init);
-
